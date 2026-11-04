@@ -1,0 +1,252 @@
+\documentclass[10pt]{article}
+\usepackage[margin=0.72in]{geometry}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+\usepackage{titlesec}
+\usepackage{parskip}
+
+\titlespacing*{\section}{0pt}{6pt}{3pt}
+\titlespacing*{\subsection}{0pt}{5pt}{2pt}
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{}{0em}{}
+\setlength{\parskip}{3pt}
+\pagestyle{empty}
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\begin{document}
+
+\begin{center}
+{\Large\bfseries The Assert Line Is Doing the Work:\\[1pt]
+An Ablation of EvaLoop's Carried Example}\\[3pt]
+{\small CSC 591/791 --- Trustworthy AI for Software Engineering, Assignment 4}
+\end{center}
+
+\vspace{-3pt}
+
+\section{Extension and Research Question}
+
+EvaLoop measures robustness by feeding a model its own output: generate code
+from a description, test it, summarise the code back to a description, repeat.
+One detail keeps the loop runnable. Before a summary becomes the next cycle's
+prompt it is wrapped as a docstring \emph{with the final assert line of the
+original prompt appended}, so the function name and signature survive. The
+paper presents this as plumbing. But that line is not only a signature --- it is
+a \textbf{worked example}: one concrete input with its expected output,
+re-injected from outside the loop into every single cycle. The model never has
+to recover the task's interface from its own summary, and it always sees one
+ground-truth test case.
+
+\textbf{Research question: how much of EvaLoop's measured robustness rests on
+that leaked example?} I added a new loop type that keeps the standard loop
+intact and weakens only what the summary carries forward, in four arms that
+remove information monotonically:
+
+\begin{center}\small
+\begin{tabular}{llc}
+\toprule
+arm & carrier appended to the summary & information retained \\
+\midrule
+\code{assert} & \code{assert f(3, 4) == 7} & name, arity, example \\
+\code{signature} & \code{def f(arg1, arg2):} & name, arity \\
+\code{name} & \code{The function must be named `f`.} & name \\
+\code{bare} & \emph{(nothing)} & nothing \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The \code{assert} arm is a re-implementation of the standard loop and serves as
+my own baseline; differences between adjacent arms attribute the standard
+loop's score to the example, the arity and the name respectively. Signature
+stability is solved rather than dodged: the \code{signature} and \code{name}
+arms still pin the function name, so a failure means the model could not
+re-derive the task from its own description, not that it renamed the function.
+The \code{bare} arm gives that up deliberately and is reported as the floor.
+
+\section{The Framework and My Changes}
+
+A cycle is a list of tasks chained by \code{BatchEvaluationCycle}: the output of
+task $n$ is the input of task $n{+}1$, and the output of the task flagged
+\code{produces\_testable\_code} is run against the EvalPlus MBPP Plus suites
+(\emph{base} = original tests, \emph{plus} = extended; a cycle passes only if
+both do). A task implements three hooks --- \code{create\_prompt},
+\code{extract\_output}, \code{postprocess} --- and registers itself with
+\code{@register\_task}. The assert re-attachment lives in
+\code{CodeSummarizationTask.postprocess}, which recovers the line as
+\code{context["cycle\_input"].splitlines()[-2]}. ASL is
+$\sum_i n_i i^2 s_i / (TM)$ in \code{analysis/metrics.py}.
+
+So a new loop type is almost entirely new code. I added two files:
+\code{tasks/assert\_ablation.py} (the four arms plus the signature recovery) and
+\code{models/gemini\_vertex.py} (a Gemini/Vertex backend --- the framework had
+none, and Gemini ids fell through to the HuggingFace branch). Six existing
+files changed: \code{tasks/\_\_init\_\_.py} (register), \code{core/config.py}
+(a \code{loop\_type} field, the arms in \code{get\_task\_configs}, Gemini
+routing, \code{max\_tasks}), \code{core/evaluator.py} (\code{loop\_type} was
+hard-coded; result files now carry the arm and a \code{run\_metadata} block
+with measured token usage), \code{models/factory.py} (register Gemini; make the
+torch/vLLM imports lazy so an API-only run does not need a 2.5\,GB install),
+and \code{cli.py} (the new flags).
+
+\textbf{The carrier is derived once, from the original prompt.}
+\code{signature\_from\_assert} parses the cycle-1 assert line with
+\code{ast} --- picking the leftmost non-builtin call, since the task function is
+often wrapped (\code{assert set(similar\_elements(...)) == ...}) and a few tasks
+are named after a builtin --- and the result is memoised per \code{task\_id}.
+Later cycles reuse the memo instead of re-reading their own docstring, so every
+arm's carrier traces to the same source as the baseline's and cannot itself
+drift. Validated against all 378 MBPP Plus assert lines: it recovers the entry
+point for 378/378.
+
+\section{Experimental Setup}
+
+Two models reachable through the course's Vertex credits,
+\code{gemini-2.5-flash} and \code{gemini-3.5-flash-lite}; greedy decoding
+($T{=}0$, top-$p$ 1.0), 1024 new tokens, max 10 cycles, one run per
+configuration; 8 runs in all. Tasks are the first 120 of EvalPlus's MBPP Plus
+ordering (the full 378 was beyond the project's request quota in the available
+time; the subset is a deterministic prefix and the \code{--max\_tasks} flag
+reproduces it). Measured cost: \textbf{\$3.08} over 14{,}342 calls (1.54M input
+/ 1.05M output tokens), \$0.0032 per task-arm.
+
+Two setup findings are worth recording because both would have silently
+corrupted the results.
+
+\textbf{Reasoning tokens starve the answer.} Gemini 2.5+ count reasoning
+against \code{max\_output\_tokens}. At EvaLoop's 1024-token budget, 35 of 120
+cycle-1 generations were cut off mid-expression (\code{for i in range(1, n}),
+pushing pass@1 to 62.5\% against a published 80.0\% on the same 120 tasks. One
+call consumed 1020 output tokens to emit 161 characters. Since the protocol
+specifies 1024 tokens \emph{for the answer}, I disable thinking; the same call
+then uses 65 output tokens and completes.
+
+\textbf{Abandoned API calls look like model failures.} An exhausted retry
+returns an empty generation, which the loop records as a broken cycle. Running
+four arms concurrently exhausted retries on ${\sim}1\%$ of calls --- unevenly
+across arms, i.e.\ exactly on the quantity being measured. The backend therefore
+paces request starts with an AIMD limiter and counts abandoned calls; a run
+with a non-zero count is marked untrustworthy. All 8 reported runs have
+\textbf{\code{hard\_failures}~=~0}.
+
+\section{Results and Failure Analysis}
+
+\begin{center}\small
+\begin{tabular}{llcccc}
+\toprule
+model & arm & pass@1 & ASL\_pow & vs \code{assert} & mid-loop failures \\
+\midrule
+\code{gemini-2.5-flash} & \code{assert} & 85.0\% & 8.115 & --- & 5 \\
+ & \code{signature} & 83.3\% & 7.974 & $-1.7\%$ & 6 \\
+ & \code{name} & 82.5\% & 7.809 & $-3.8\%$ & 6 \\
+ & \code{bare} & 81.7\% & 6.593 & $-18.8\%$ & 21 \\
+\midrule
+\code{gemini-3.5-flash-lite} & \code{assert} & 85.0\% & 7.982 & --- & 7 \\
+ & \code{signature} & 83.3\% & 7.324 & $-8.2\%$ & 15 \\
+ & \code{name} & 84.2\% & 7.705 & $-3.5\%$ & 10 \\
+ & \code{bare} & 83.3\% & \textbf{1.794} & $\mathbf{-77.5\%}$ & 85 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Internal validity.} pass@1 is flat across arms (81.7--85.0\%) while
+mid-loop failures move by more than an order of magnitude. That is what the
+design predicts: cycle 1's input is the untouched prompt in every arm, so the
+arms must agree there and may only diverge from cycle 2, where the carrier
+enters. The protocol check puts my \code{assert} arm at ASL\_pow 8.115 against
+the published 6.923 (all 378 tasks) and 7.167 (the same 120). Being modestly
+above is consistent with disabling thinking and with model drift since the data
+was collected; the absolute values are therefore not interchangeable with the
+leaderboard's, and I rely only on within-experiment comparisons.
+
+\textbf{The assert line compresses the ranking.} Under the standard loop the
+two models look equally robust: 8.115 versus 7.982, 1.7\% apart. Remove the
+carrier and they are 6.593 versus 1.794 --- a factor of 3.7. The leaked example
+is not a small convenience; it \emph{hides} a large difference in how well each
+model can reconstruct a task from its own prose. \code{gemini-2.5-flash}
+degrades gracefully (77 of 120 tasks still survive 10 cycles bare);
+\code{gemini-3.5-flash-lite} collapses (15 survive, 49 break at cycle 2).
+
+\textbf{Failure modes.} I adjudicated 35 failed loops --- 4 per arm plus 3 from
+the provided baseline, stratified by arm, excluding loops that broke at cycle 1
+because the arms are identical there by construction. The causes partition
+almost exactly along what each arm removed:
+
+\begin{center}\small
+\begin{tabular}{lcccccc}
+\toprule
+arm & signature-drift & lost-example & dropped-req. & cannot-impl. & plus-only & other \\
+\midrule
+\code{assert} & 0 & 0 & 4 & 0 & 4 & 0 \\
+\code{signature} & 0 & 4 & 0 & 0 & 4 & 0 \\
+\code{name} & 0 & 2 & 2 & 1 & 3 & 0 \\
+\code{bare} & \textbf{6} & 2 & 0 & 0 & 0 & 0 \\
+provided baseline & 0 & 0 & 0 & 0 & 0 & \textbf{3} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\emph{A loop the extension broke.} \code{Mbpp/69} (\code{is\_sublist}) fails in
+three different arms for the same reason and never in \code{assert}. The
+summary is faithful --- ``determines if \code{sub\_list} is a contiguous
+sequence within \code{main\_list}'' --- but the test calls
+\code{is\_sublist(main, sub)}. The original assert line shows that order; a
+prose summary does not. Without it the model writes
+\code{def is\_sublist(sub\_list, main\_list)} and fails on argument order, not
+on semantics. This is the mechanism the ablation was built to expose, and it is
+invisible to the standard loop.
+
+\emph{A loop it did not break.} \code{Mbpp/244} (\code{next\_Perfect\_Square})
+fails identically in \code{assert} and \code{signature} at cycle 1 with
+\code{base} passing and only \code{plus} failing: an EvalPlus edge case, not
+drift. Such \code{plus-only} failures are uniform background noise across arms
+(4, 4, 3, 0) and the carrier has no bearing on them.
+
+\emph{The provided baseline contains infrastructure failures.} All three
+sampled baseline failures have \code{Error generating response: 'NoneType'
+object is not subscriptable} stored where the generated code belongs --- API
+errors recorded as loop failures --- and the LLM judge scored each
+\code{boundary\_similarity}~=~1.0, so the published pipeline's own drift check
+did not flag them. This is the contamination my \code{hard\_failures} counter
+exists to prevent, and it means the published ASL values are, to some unknown
+extent, measuring API reliability.
+
+\section{Limitations and Implications}
+
+\textbf{Two models is a pairwise comparison, not a ranking.} I can show how
+much each model depends on the carrier; I cannot claim the ablation reorders a
+leaderboard. The ordering in fact does not flip --- what changes is the
+magnitude, by $11\times$.
+
+\textbf{The gradient is not monotone, and that is informative.} For
+\code{gemini-3.5-flash-lite}, \code{signature} ($-8.2\%$) hurts \emph{more}
+than \code{name} ($-3.5\%$), although it carries strictly more information.
+Inspection suggests \code{def f(arg1, arg2):} actively misleads: the model
+adopts the meaningless parameter names and loses the semantic cues it would
+otherwise have taken from the description. A carrier can be worse than a weaker
+carrier if it displaces better information --- so ``more context'' is not
+monotonically safer.
+
+\textbf{What the numbers do not establish.} 120 tasks leaves roughly 7 mid-loop
+failures per well-behaved arm, so the \code{assert}/\code{signature}/\code{name}
+differences (1.7--8.2\%) rest on single-digit counts and I would not defend
+their ordering; only the \code{bare} effect ($-18.8\%$, $-77.5\%$) is large
+relative to that noise. One run per configuration means no variance estimate.
+Thinking is disabled, which is a deviation from whatever configuration produced
+the published data. Finally, the 35 failure labels were produced by an LLM
+reading each loop's full source context and then reviewed and accepted by the
+author, not assigned by independent annotators; the worksheet carrying the
+evidence for every label ships with the submission so they can be rechecked.
+
+\textbf{Implication.} EvaLoop's headline claim is that self-consistency
+measures robustness without external perturbations. The ablation shows that the
+standard loop also quietly supplies the model with a ground-truth test case
+every cycle, and that this single leak accounts for most of the measured
+robustness of a weaker model --- 77.5\% of \code{gemini-3.5-flash-lite}'s ASL.
+A benchmark whose scores are produced partly by information it injects itself
+will compress the differences it exists to reveal. If the goal is to measure
+whether a model can sustain its own description of a task, the interface should
+be carried by something that cannot double as an answer --- a signature derived
+from the model's own code, for instance --- and the carrier should be reported
+as a parameter of the benchmark, not left as plumbing.
+
+\end{document}

@@ -97,3 +97,15 @@ package.json
 
 # Results
 results/*
+# assignment 4 working files
+.venv/
+results/
+review/
+summary.csv
+results_run.log
+run.pid
+report.pdf
+report.aux
+report.log
+report.out
+*.patch

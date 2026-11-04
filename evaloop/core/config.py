@@ -16,6 +16,15 @@ class EvaluationConfig:
     # Dataset configuration
     dataset: str = "mbpp_plus"
     languages: List[str] = field(default_factory=lambda: ["python"])
+
+    # Which loop to run: "code_generation_summarization" (upstream default) or
+    # one of the assert-ablation arms, see get_task_configs / ABLATION_ARMS.
+    loop_type: str = "code_generation_summarization"
+
+    #: Evaluate only the first N tasks of the dataset (deterministic prefix of
+    #: the EvalPlus ordering). None = the full benchmark. Used for smoke runs
+    #: and for documented task subsets.
+    max_tasks: Optional[int] = None
     
     # Evaluation parameters
     max_cycles: int = 10
@@ -50,6 +59,13 @@ class EvaluationConfig:
     
     # API configuration
     openai_api_key: Optional[str] = None
+
+    # Vertex AI (Gemini) configuration. Auth is Application Default
+    # Credentials, so there is no API key here.
+    vertex_project: Optional[str] = None
+    vertex_location: str = "global"
+    #: Concurrent in-flight requests for API backends that support batching.
+    api_workers: int = 16
     
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -84,6 +100,10 @@ class EvaluationConfig:
         # Set OpenAI API key from environment if not provided
         if self.openai_api_key is None:
             self.openai_api_key = os.environ.get("OPENAI_API_KEY")
+
+        # Vertex project falls back to the gcloud/ADC environment
+        if self.vertex_project is None:
+            self.vertex_project = os.environ.get("GOOGLE_CLOUD_PROJECT")
     
     def _generate_experiment_name(self) -> str:
         """Generate a default experiment name based on configuration."""
@@ -129,7 +149,12 @@ class EvaluationConfig:
     def _create_model_config(self, model: str) -> Dict[str, Any]:
         """Create configuration for a specific model."""
         # Determine model type based on model name/path
-        if any(provider in model.lower() for provider in ["gpt", "chatgpt", "openai"]):
+        if "gemini" in model.lower():
+            # Checked before the generic patterns: without this, Gemini ids
+            # fall through to the HuggingFace branch and the run dies trying to
+            # download them from the Hub.
+            model_type = "gemini"
+        elif any(provider in model.lower() for provider in ["gpt", "chatgpt", "openai"]):
             model_type = "openai"
         elif "claude" in model.lower():
             model_type = "anthropic"
@@ -150,7 +175,19 @@ class EvaluationConfig:
             "top_p": self.top_p,
         }
         
-        if model_type == "openai":
+        if model_type == "gemini":
+            base_config.update({
+                "model_id": model,
+                "project": self.vertex_project,
+                "location": self.vertex_location,
+                # EvaLoop's protocol is 1024 new tokens per generation; the
+                # OpenAI branch passes max_model_len here, which would silently
+                # change the protocol for Gemini runs.
+                "max_tokens": self.max_new_tokens,
+                "system_prompt": self.system_prompt if self.is_chat_model else None,
+                "workers": self.api_workers,
+            })
+        elif model_type == "openai":
             base_config.update({
                 "model_id": model,
                 "api_key": self.openai_api_key,
@@ -402,6 +439,25 @@ class EvaluationConfig:
         # This method is now replaced by _is_vllm_supported but kept for backward compatibility
         return self._is_vllm_supported(model)
     
+    #: Generation prompt used by the assert-ablation arms. Taken verbatim from
+    #: the course data package (prompts/task_prompts.md) so that a locally run
+    #: `ablation_assert` arm reproduces the published protocol.
+    ABLATION_GENERATION_PROMPT = (
+        "Generate Python code for the following task:\n\n"
+        "{description}\n\n"
+        "Return only the code, without explanations or comments."
+    )
+
+    #: loop_type -> summarisation task type, for the assert-line ablation.
+    #: Each arm weakens the information carried from the original prompt into
+    #: every cycle; see evaloop/tasks/assert_ablation.py.
+    ABLATION_ARMS = {
+        "ablation_assert": "code_summarization_assert",
+        "ablation_signature": "code_summarization_signature",
+        "ablation_name": "code_summarization_name",
+        "ablation_bare": "code_summarization_bare",
+    }
+
     def get_task_configs(self, task_type: str = "code_generation_summarization") -> List[Dict[str, Any]]:
         """Generate task configurations based on task type."""
         if task_type == "code_generation_summarization":
@@ -412,12 +468,28 @@ class EvaluationConfig:
                     "prompt_template": "Generate Python code for the following task: \n{description}\nReturn only the code, without explanations or comments.",
                 },
                 {
-                    "type": "code_summarization", 
+                    "type": "code_summarization",
                     "prompt_template": "Use one sentence to summarize the following code and start with 'write a python function to':\n\n```\n{code}\n```\n\n```\nwrite a python function to\n```",
+                },
+            ]
+        elif task_type in self.ABLATION_ARMS:
+            # Assert-line ablation: generation is held fixed, and the arms
+            # differ only in what the summarisation step carries forward.
+            return [
+                {
+                    "type": "code_generation",
+                    "language": "python",
+                    "prompt_template": self.ABLATION_GENERATION_PROMPT,
+                },
+                {
+                    "type": self.ABLATION_ARMS[task_type],
                 },
             ]
         elif task_type == "code_translation":
             # Code translation is not currently supported but kept as interface
             raise NotImplementedError("Code translation is not currently supported")
         else:
-            raise ValueError(f"Unsupported task type: {task_type}. Currently only 'code_generation_summarization' is supported.")
+            supported = ", ".join(
+                ["code_generation_summarization", *sorted(self.ABLATION_ARMS)]
+            )
+            raise ValueError(f"Unsupported task type: {task_type}. Supported: {supported}.")

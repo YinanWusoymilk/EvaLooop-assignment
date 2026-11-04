@@ -52,8 +52,28 @@ class EvaLoopEvaluator:
         # Run evaluation
         model_result = self._run_evaluation_cycles(model, tasks, prompts, py_problems, tester)
         
-        # Save and return results
-        self._save_results([model_result], "code_generation_summarization")
+        # Record the settings and the measured API spend alongside the results,
+        # so every reported number is traceable to the run that produced it.
+        model_result["run_metadata"] = {
+            "loop_type": self.config.loop_type,
+            "model": self.config.model,
+            "dataset": self.config.dataset,
+            "n_tasks": len(prompts),
+            "max_cycles": self.config.max_cycles,
+            "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
+            "max_new_tokens": self.config.max_new_tokens,
+        }
+        if hasattr(model, "usage"):
+            model_result["run_metadata"]["token_usage"] = model.usage
+        if hasattr(model, "cost_usd"):
+            model_result["run_metadata"]["cost_usd"] = model.cost_usd()
+            self.logger.info("API usage — %s", model.usage_report())
+
+        # Save and return results. Tagged with loop_type, not the literal
+        # "code_generation_summarization": the ablation arms are separate runs
+        # and would otherwise all write to the same filename.
+        self._save_results([model_result], self.config.loop_type)
         return [model_result]
     
     def run_code_translation(self) -> Dict[str, Any]:
@@ -77,9 +97,13 @@ class EvaLoopEvaluator:
     
     def _create_tasks(self):
         """Create task instances."""
-        task_configs = self.config.get_task_configs("code_generation_summarization")
+        # Was hard-coded to "code_generation_summarization"; now driven by
+        # config so the assert-ablation arms can be selected from the CLI.
+        task_configs = self.config.get_task_configs(self.config.loop_type)
         tasks = [self.task_factory.create_task(config) for config in task_configs]
-        self.logger.info(f"Created {len(tasks)} tasks for evaluation")
+        self.logger.info(
+            f"Created {len(tasks)} tasks for evaluation (loop_type={self.config.loop_type})"
+        )
         return tasks
     
     def _load_dataset(self):
@@ -94,7 +118,14 @@ class EvaLoopEvaluator:
                 "task_id": task_id,
                 "prompt": problem["prompt"]
             })
-        
+
+        # Optional deterministic prefix, for smoke runs and documented subsets.
+        if self.config.max_tasks is not None:
+            prompts = prompts[: self.config.max_tasks]
+            kept = {p["task_id"] for p in prompts}
+            py_problems = {k: v for k, v in py_problems.items() if k in kept}
+            self.logger.info(f"Restricted to the first {len(prompts)} tasks")
+
         self.logger.info(f"Prepared {len(prompts)} prompts from MBPP dataset")
         return prompts, py_problems
     

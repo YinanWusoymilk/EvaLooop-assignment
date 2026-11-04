@@ -71,6 +71,8 @@ class EvaLoopCLI:
         self,
         model: str,
         dataset: str = "mbpp_plus",
+        loop_type: str = "code_generation_summarization",
+        max_tasks: Optional[int] = None,
         max_cycles: int = 10,
         temperature: float = 0.0,
         top_p: float = 1.0,
@@ -92,6 +94,9 @@ class EvaLoopCLI:
         preferred_batch_size: int = 64,
         is_chat_model: bool = True,
         system_prompt: str = "You are a helpful programming assistant.",
+        vertex_project: Optional[str] = None,
+        vertex_location: str = "global",
+        api_workers: int = 16,
     ) -> Dict[str, Any]:
         """
         Run code generation and summarization evaluation experiment.
@@ -107,6 +112,12 @@ class EvaLoopCLI:
             model: Single model name/path to evaluate.
                    Examples: "gpt-4", "Qwen/Qwen2.5-Coder-32B-Instruct"
             dataset: Dataset to use for evaluation. Currently only "mbpp_plus" is supported.
+            loop_type: Which loop to run. "code_generation_summarization" is the
+                       upstream default. The assert-line ablation arms are
+                       "ablation_assert", "ablation_signature", "ablation_name"
+                       and "ablation_bare" — identical except for what the
+                       summary carries forward from the original prompt
+                       (see evaloop/tasks/assert_ablation.py).
             max_cycles: Maximum number of evaluation cycles to run.
             temperature: Temperature for model generation (0.0 for greedy decoding).
             top_p: Top-p (nucleus) sampling parameter.
@@ -183,6 +194,8 @@ class EvaLoopCLI:
         config = EvaluationConfig(
             model=model.strip(),
             dataset=dataset,
+            loop_type=loop_type,
+            max_tasks=max_tasks,
             max_cycles=max_cycles,
             temperature=temperature,
             top_p=top_p,
@@ -203,6 +216,9 @@ class EvaLoopCLI:
             is_chat_model=is_chat_model,
             system_prompt=system_prompt,
             openai_api_key=openai_api_key,
+            vertex_project=vertex_project,
+            vertex_location=vertex_location,
+            api_workers=api_workers,
         )
         # Log model type detection results
         model_config = config.get_model_config()

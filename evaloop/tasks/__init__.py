@@ -10,6 +10,14 @@ from .factory import TaskFactory, register_task
 from .code_generation import CodeGenerationTask
 from .code_summarization import CodeSummarizationTask
 from .code_translation import CodeTranslationTask
+from .assert_ablation import (
+    AssertAblationSummarizationTask,
+    AssertCarrierSummarizationTask,
+    BareSummarizationTask,
+    NameCarrierSummarizationTask,
+    SignatureCarrierSummarizationTask,
+    signature_from_assert,
+)
 
 __all__ = [
     "BaseTask",
@@ -18,4 +26,10 @@ __all__ = [
     "CodeGenerationTask",
     "CodeSummarizationTask",
     "CodeTranslationTask",
+    "AssertAblationSummarizationTask",
+    "AssertCarrierSummarizationTask",
+    "SignatureCarrierSummarizationTask",
+    "NameCarrierSummarizationTask",
+    "BareSummarizationTask",
+    "signature_from_assert",
 ]
